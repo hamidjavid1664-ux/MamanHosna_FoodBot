@@ -53,7 +53,7 @@ async function send(chatId, text, keyboard) {
   return bale("sendMessage", body);
 }
 function keyboard(rows) {
-  return { keyboard: rows.map(r => r.map(text => ({ text }))), resize_keyboard: true };
+  return { keyboard: rows.map(r => r.map(text => ({ text }))), resize_keyboard: true, one_time_keyboard: false, is_persistent: true };
 }
 const MAIN = keyboard([
   ["🍽️ مشاهده منو", "🛒 ثبت سفارش"],

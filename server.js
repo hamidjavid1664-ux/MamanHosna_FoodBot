@@ -456,7 +456,17 @@ async function pollLoop() {
       const updates = await bale("getUpdates", { offset, timeout: Number(process.env.POLL_TIMEOUT || 25), allowed_updates: ["message"] });
       for (const update of updates || []) {
         offset = Math.max(offset, Number(update.update_id) + 1);
-        try { await handleMessage(update.message); }
+        const msg = update.message;
+        // Log group chat identifiers so ADMIN_CHAT_ID can be configured safely.
+        if (msg?.chat && msg.chat.type !== "private") {
+          console.log("BALE_GROUP_CHAT", JSON.stringify({
+            chat_id: String(msg.chat.id),
+            type: msg.chat.type,
+            title: msg.chat.title || null,
+            text: String(msg.text || "").slice(0, 80)
+          }));
+        }
+        try { await handleMessage(msg); }
         catch (e) { console.error("Message handler error:", e.message); }
       }
     } catch (e) {

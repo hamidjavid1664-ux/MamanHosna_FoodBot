@@ -126,13 +126,16 @@ async function initDb() {
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS total INTEGER",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_sent BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS survey_sent BOOLEAN NOT NULL DEFAULT FALSE",
-    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()"
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_method TEXT",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking_url TEXT",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking_note TEXT"
   ];
   for (const q of additions) await pool.query(q);
   for (const [id, name, price] of PRODUCTS) {
     await pool.query(
       `INSERT INTO products(id,name,price,stock) VALUES($1,$2,$3,0)
-       ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name, price=EXCLUDED.price`,
+       ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name`,
       [id, name, price]
     );
   }
@@ -163,9 +166,18 @@ async function sendAdminOrder(orderId, prefix = "🛒 سفارش جدید") {
   const row = (await pool.query("SELECT * FROM orders WHERE id=$1", [orderId])).rows[0];
   if (!row || !ADMIN_ID) return;
   const items = Array.isArray(row.items) ? row.items : JSON.parse(row.items);
+  const method = row.delivery_method ? `\nروش ارسال: ${row.delivery_method}` : "";
+  const tracking = row.tracking_url ? `\nلینک پیگیری: ${row.tracking_url}` : "";
+  const rows = [];
+  if (row.status === "در انتظار تعیین هزینه ارسال") rows.push([`💵 هزینه پیک #${row.id}`, `📦 هزینه اسنپ‌باکس #${row.id}`]);
+  rows.push([`✅ تأیید سفارش #${row.id}`, `❌ لغو سفارش #${row.id}`]);
+  if (["فاکتور صادر شده", "تأیید شده", "در حال آماده‌سازی"].includes(row.status)) rows.push([`🍳 شروع آماده‌سازی #${row.id}`, `🥘 غذای آماده است #${row.id}`]);
+  if (["آماده ارسال", "در حال آماده‌سازی"].includes(row.status)) rows.push([`🚚 تحویل به پیک/اسنپ #${row.id}`]);
+  if (row.status === "ارسال‌شده") rows.push([`✅ تحویل‌شده #${row.id}`]);
+  rows.push(["🏠 منوی اصلی"]);
   await send(ADMIN_ID,
-    `${prefix} #${row.id}\nمشتری: ${row.customer_name || "نامشخص"}\nشناسه بله: ${row.chat_id}\nتلفن: ${row.phone || "ثبت نشده"}\nنشانی: ${row.address || "ثبت نشده"}\n\n${orderSummary(row, items)}\n\nوضعیت: ${row.status}`,
-    keyboard([["💵 تعیین هزینه ارسال #" + row.id], ["🍳 آماده‌سازی #" + row.id], ["🚚 ارسال‌شده #" + row.id], ["✅ تحویل‌شده #" + row.id], ["🏠 منوی اصلی"]])
+    `${prefix} #${row.id}\nمشتری: ${row.customer_name || "نامشخص"}\nشناسه بله: ${row.chat_id}\nتلفن: ${row.phone || "ثبت نشده"}\nنشانی: ${row.address || "ثبت نشده"}\n${method}${tracking}\n\n${orderSummary(row, items)}\n\nوضعیت: ${row.status}`,
+    keyboard(rows)
   );
 }
 async function handleAdmin(chatId, text) {
@@ -195,7 +207,7 @@ async function handleAdmin(chatId, text) {
   if (text === "➕ تغییر موجودی") {
     sessions.set(String(chatId), { mode: "stock_product" });
     const ps = await getProducts();
-    return send(chatId, "غذا را انتخاب کن:", keyboard(ps.map(p => [p.name]).concat([["🏠 منوی اصلی"]])));
+    return send(chatId, "غذا را انتخاب کنید؛ موجودی فعلی کنار نام غذا آمده است:", keyboard(ps.map(p => [`${p.name} | موجودی: ${faNum(p.stock)}`]).concat([["🏠 منوی اصلی"]])));
   }
   if (text === "🧾 سفارش‌های جدید") {
     const rows = (await pool.query("SELECT id,customer_name,status FROM orders WHERE status='در انتظار تعیین هزینه ارسال' ORDER BY id DESC LIMIT 15")).rows;
@@ -228,65 +240,119 @@ async function handleAdmin(chatId, text) {
     return send(chatId, rows.length ? rows.map(r => `#${r.id} — ${r.product_name}\nتعداد: ${r.quantity}\nمشتری: ${r.customer_name || "نامشخص"} (${r.chat_id})\nتوضیح: ${r.note || "—"}`).join("\n\n") : "درخواست پیش‌سفارش جدیدی نیست.", ADMIN);
   }
   if (sess?.mode === "stock_product") {
-    const p = (await pool.query("SELECT * FROM products WHERE name=$1", [text])).rows[0];
-    if (!p) return send(chatId, "لطفاً غذا را از دکمه‌های فهرست انتخاب کن.", ADMIN);
+    const productName = text.split(" | موجودی:")[0].trim();
+    const p = (await pool.query("SELECT * FROM products WHERE name=$1", [productName])).rows[0];
+    if (!p) return send(chatId, "لطفاً غذا را از دکمه‌های فهرست انتخاب کنید.", ADMIN);
     sessions.set(String(chatId), { mode: "stock_qty", productId: p.id, productName: p.name });
-    return send(chatId, `موجودی جدید «${p.name}» را وارد کن. برای ناموجود کردن، عدد ۰ را بفرست.`);
+    return send(chatId, `🍲 ${p.name}\nموجودی فعلی: ${faNum(p.stock)} عدد\nعدد جدید را وارد کنید یا «🔴 اتمام غذا» را بزنید.`, keyboard([["🔴 اتمام غذا"], ["❌ انصراف"]]));
   }
   if (sess?.mode === "stock_qty") {
-    const qty = Number(text);
-    if (!Number.isInteger(qty) || qty < 0 || qty > 100000) return send(chatId, "یک عدد صحیح از ۰ به بالا وارد کن.");
-    await pool.query("UPDATE products SET stock=$1, updated_at=NOW() WHERE id=$2", [qty, sess.productId]);
-    sessions.delete(String(chatId));
-    return send(chatId, `✅ موجودی «${sess.productName}» روی ${faNum(qty)} عدد تنظیم شد.`, ADMIN);
+    if (text === "❌ انصراف") { sessions.delete(String(chatId)); return send(chatId, "تغییر موجودی لغو شد.", ADMIN); }
+    const qty = text === "🔴 اتمام غذا" ? 0 : Number(text.replace(/[٬,،\s]/g, ""));
+    if (!Number.isInteger(qty) || qty < 0 || qty > 100000) return send(chatId, "یک عدد صحیح از ۰ به بالا وارد کنید یا «🔴 اتمام غذا» را بزنید.", keyboard([["🔴 اتمام غذا"], ["❌ انصراف"]]));
+    sessions.set(String(chatId), { ...sess, mode: "stock_confirm", newQty: qty });
+    return send(chatId, `تأیید تغییر موجودی\nغذا: ${sess.productName}\nموجودی جدید: ${faNum(qty)} عدد\n\nتغییر ثبت شود؟`, keyboard([["✅ تأیید موجودی"], ["🔁 اصلاح تعداد", "❌ انصراف"]]));
   }
-  const feeMatch = text.match(/^💵 تعیین هزینه ارسال #(\d+)$/);
+  if (sess?.mode === "stock_confirm") {
+    if (text === "🔁 اصلاح تعداد") { sessions.set(String(chatId), { ...sess, mode: "stock_qty" }); return send(chatId, "عدد جدید را وارد کنید یا اتمام غذا را بزنید.", keyboard([["🔴 اتمام غذا"], ["❌ انصراف"]])); }
+    if (text === "❌ انصراف") { sessions.delete(String(chatId)); return send(chatId, "تغییر موجودی لغو شد.", ADMIN); }
+    if (text !== "✅ تأیید موجودی") return send(chatId, "برای ثبت تغییر، «✅ تأیید موجودی» را بزنید.", keyboard([["✅ تأیید موجودی"], ["🔁 اصلاح تعداد", "❌ انصراف"]]));
+    await pool.query("UPDATE products SET stock=$1, updated_at=NOW() WHERE id=$2", [sess.newQty, sess.productId]);
+    sessions.delete(String(chatId));
+    return send(chatId, `✅ موجودی «${sess.productName}» روی ${faNum(sess.newQty)} عدد ثبت شد.`, ADMIN);
+  }
+  let feeMatch = text.match(/^💵 هزینه پیک #(\d+)$/) || text.match(/^📦 هزینه اسنپ‌باکس #(\d+)$/) || text.match(/^💵 تعیین هزینه ارسال #(\d+)$/);
   if (feeMatch) {
-    sessions.set(String(chatId), { mode: "delivery_fee", orderId: Number(feeMatch[1]) });
-    return send(chatId, `هزینه پیک/اسنپ برای سفارش #${feeMatch[1]} را به تومان وارد کن. فقط عدد بفرست؛ اگر ارسال رایگان است عدد ۰.`);
+    const method = text.startsWith("📦") ? "اسنپ‌باکس" : "پیک";
+    sessions.set(String(chatId), { mode: "delivery_fee", orderId: Number(feeMatch[1]), deliveryMethod: method });
+    return send(chatId, `هزینه ${method} برای سفارش #${feeMatch[1]} را به تومان وارد کنید. اگر رایگان است ۰ بفرستید.`, keyboard([["❌ انصراف"]]));
   }
   if (sess?.mode === "delivery_fee") {
+    if (text === "❌ انصراف") { sessions.delete(String(chatId)); return send(chatId, "ثبت هزینه ارسال لغو شد.", ADMIN); }
     const fee = Number(text.replace(/[٬,،\s]/g, ""));
-    if (!Number.isSafeInteger(fee) || fee < 0 || fee > 100000000) return send(chatId, "هزینه را به صورت عدد صحیح و به تومان وارد کن؛ مثال: ۸۰۰۰۰.");
-    const result = await pool.query("UPDATE orders SET delivery_fee=$1,total=subtotal+$1,status='فاکتور صادر شده',invoice_sent=TRUE,updated_at=NOW() WHERE id=$2 RETURNING *", [fee, sess.orderId]);
+    if (!Number.isSafeInteger(fee) || fee < 0 || fee > 100000000) return send(chatId, "هزینه را به صورت عدد صحیح و به تومان وارد کنید؛ مثال: ۸۰۰۰۰.");
+    sessions.set(String(chatId), { ...sess, mode: "delivery_fee_confirm", fee });
+    return send(chatId, `تأیید فاکتور سفارش #${sess.orderId}\nروش ارسال: ${sess.deliveryMethod}\nهزینه ارسال: ${money(fee)}\n\nبا تأیید، فاکتور نهایی برای مشتری ارسال می‌شود.`, keyboard([["✅ تأیید و ارسال فاکتور"], ["🔁 اصلاح هزینه", "❌ انصراف"]]));
+  }
+  if (sess?.mode === "delivery_fee_confirm") {
+    if (text === "🔁 اصلاح هزینه") { sessions.set(String(chatId), { ...sess, mode: "delivery_fee" }); return send(chatId, "هزینه جدید را به تومان وارد کنید.", keyboard([["❌ انصراف"]])); }
+    if (text === "❌ انصراف") { sessions.delete(String(chatId)); return send(chatId, "ثبت هزینه لغو شد.", ADMIN); }
+    if (text !== "✅ تأیید و ارسال فاکتور") return send(chatId, "برای ارسال فاکتور، «✅ تأیید و ارسال فاکتور» را بزنید.", keyboard([["✅ تأیید و ارسال فاکتور"], ["🔁 اصلاح هزینه", "❌ انصراف"]]));
+    const result = await pool.query("UPDATE orders SET delivery_fee=$1,total=subtotal+$1,delivery_method=$2,status='فاکتور صادر شده',invoice_sent=TRUE,updated_at=NOW() WHERE id=$3 RETURNING *", [sess.fee, sess.deliveryMethod, sess.orderId]);
     sessions.delete(String(chatId));
     const o = result.rows[0];
     if (!o) return send(chatId, "این شماره سفارش پیدا نشد.", ADMIN);
     const items = Array.isArray(o.items) ? o.items : JSON.parse(o.items);
-    await send(o.chat_id, orderSummary(o, items, fee) + "\n\nلطفاً برای تأیید فاکتور با مامان حسنا هماهنگ کنید.", MAIN);
+    await send(o.chat_id, orderSummary(o, items, sess.fee) + `\nروش ارسال: ${sess.deliveryMethod}\n\nبرای تأیید سفارش، دکمه «تأیید فاکتور» را بزنید.`, keyboard([["✅ تأیید فاکتور"], ["❌ لغو سفارش"]]));
     await send(chatId, `✅ فاکتور سفارش #${o.id} برای مشتری ارسال شد.\nمبلغ نهایی: ${money(o.total)}`, ADMIN);
+    await sendAdminOrder(o.id, "🧾 فاکتور ارسال‌شده");
     return;
   }
-  const statusActions = [
-    { re: /^🍳 آماده‌سازی #(\d+)$/, status: "در حال آماده‌سازی" },
-    { re: /^🚚 ارسال‌شده #(\d+)$/, status: "ارسال‌شده" },
-    { re: /^✅ تحویل‌شده #(\d+)$/, status: "تحویل‌شده" }
-  ];
-  for (const a of statusActions) {
-    const m = text.match(a.re);
-    if (!m) continue;
-    const id = Number(m[1]);
-    const r = await pool.query("UPDATE orders SET status=$1,updated_at=NOW() WHERE id=$2 RETURNING *", [a.status, id]);
+  const actionMatch = text.match(/^(✅ تأیید سفارش|❌ لغو سفارش|🍳 شروع آماده‌سازی|🥘 غذای آماده است|🚚 تحویل به پیک\/اسنپ|🚚 ارسال‌شده|✅ تحویل‌شده) #(\d+)$/);
+  if (actionMatch) {
+    const action = actionMatch[1], id = Number(actionMatch[2]);
+    if (action === "❌ لغو سفارش") {
+      const client = await pool.connect();
+      let o;
+      try {
+        await client.query("BEGIN");
+        o = (await client.query("SELECT * FROM orders WHERE id=$1 FOR UPDATE", [id])).rows[0];
+        if (!o) { await client.query("ROLLBACK"); return send(chatId, "سفارش پیدا نشد.", ADMIN); }
+        if (o.status === "لغو شده") { await client.query("ROLLBACK"); return send(chatId, `سفارش #${id} قبلاً لغو شده است.`, ADMIN); }
+        const items = Array.isArray(o.items) ? o.items : JSON.parse(o.items);
+        for (const item of items) if (item.product_id) await client.query("UPDATE products SET stock=stock+$1,updated_at=NOW() WHERE id=$2", [Number(item.quantity || 0), item.product_id]);
+        await client.query("UPDATE orders SET status='لغو شده',updated_at=NOW() WHERE id=$1", [id]);
+        await client.query("COMMIT");
+      } catch (e) { await client.query("ROLLBACK").catch(()=>{}); throw e; } finally { client.release(); }
+      await send(o.chat_id, `❌ متأسفانه سفارش شماره #${id} لغو شد. برای هماهنگی با مامان حسنا تماس بگیرید: ۰۹۱۷۷۷۰۰۹۶۱`, MAIN);
+      return send(chatId, `سفارش #${id} لغو شد و موجودی غذا به انبار برگشت.`, ADMIN);
+    }
+    if (action === "🚚 تحویل به پیک/اسنپ") {
+      sessions.set(String(chatId), { mode: "tracking_info", orderId: id });
+      return send(chatId, `روش ارسال سفارش #${id} را انتخاب کنید:`, keyboard([["🚚 پیک", "📦 اسنپ‌باکس"], ["❌ انصراف"]]));
+    }
+    if (sess?.mode === "tracking_info" && sess.orderId === id) { /* handled below */ }
+    const statuses = { "✅ تأیید سفارش": "تأیید شده", "🍳 شروع آماده‌سازی": "در حال آماده‌سازی", "🥘 غذای آماده است": "آماده ارسال", "🚚 ارسال‌شده": "ارسال‌شده", "✅ تحویل‌شده": "تحویل‌شده" };
+    const status = statuses[action];
+    if (status) {
+      const r = await pool.query("UPDATE orders SET status=$1,updated_at=NOW() WHERE id=$2 AND status <> 'لغو شده' RETURNING *", [status, id]);
+      const o = r.rows[0];
+      if (!o) return send(chatId, "سفارش پیدا نشد یا لغو شده است.", ADMIN);
+      if (status === "تحویل‌شده") {
+        await pool.query(`INSERT INTO loyalty_events(chat_id,order_id,amount) VALUES($1,$2,$3) ON CONFLICT(order_id) DO NOTHING`, [String(o.chat_id), Number(o.id), Number(o.total || o.subtotal || 0)]);
+        const loyalty = await pool.query("SELECT COUNT(*)::int AS n, COALESCE(SUM(amount),0)::bigint AS spent FROM loyalty_events WHERE chat_id=$1", [String(o.chat_id)]);
+        await send(o.chat_id, `🎉 سفارش شما تحویل شد.\nتعداد خریدهای موفق شما: ${faNum(loyalty.rows[0].n)}\nمجموع خریدهای موفق: ${money(loyalty.rows[0].spent)}\nاز همراهی شما سپاسگزاریم 💚`, MAIN);
+        if (!o.survey_sent) {
+          await pool.query("UPDATE orders SET survey_sent=TRUE WHERE id=$1", [id]);
+          sessions.set(String(o.chat_id), { mode: "survey", orderId: id, step: "taste", values: {} });
+          await send(o.chat_id, "🌷 لطفاً به طعم و مزه غذا از ۱ تا ۵ امتیاز بدهید.", keyboard([["۱","۲","۳","۴","۵"]]));
+        }
+      } else {
+        const customerMessage = status === "آماده ارسال" ? `🥘 غذای شما در سفارش #${id} آماده است.` : status === "در حال آماده‌سازی" ? `🍳 سفارش #${id} در حال آماده‌سازی است.` : status === "تأیید شده" ? `✅ سفارش #${id} تأیید شد.` : `📦 وضعیت سفارش #${id}: ${status}`;
+        await send(o.chat_id, customerMessage, MAIN);
+      }
+      await sendAdminOrder(id, `به‌روزرسانی سفارش #${id}`);
+      return send(chatId, `✅ وضعیت سفارش #${id} به «${status}» تغییر کرد.`, ADMIN);
+    }
+  }
+  if (sess?.mode === "tracking_info") {
+    if (text === "❌ انصراف") { sessions.delete(String(chatId)); return send(chatId, "ثبت اطلاعات ارسال لغو شد.", ADMIN); }
+    if (text === "🚚 پیک" || text === "📦 اسنپ‌باکس") {
+      sessions.set(String(chatId), { ...sess, mode: "tracking_link", deliveryMethod: text === "🚚 پیک" ? "پیک" : "اسنپ‌باکس" });
+      return send(chatId, "لینک پیگیری یا توضیح ارسال را وارد کنید. اگر لینک ندارید، «بدون لینک» را بزنید.", keyboard([["بدون لینک"], ["❌ انصراف"]]));
+    }
+  }
+  if (sess?.mode === "tracking_link") {
+    if (text === "❌ انصراف") { sessions.delete(String(chatId)); return send(chatId, "ثبت اطلاعات ارسال لغو شد.", ADMIN); }
+    const link = text === "بدون لینک" ? null : text;
+    const r = await pool.query("UPDATE orders SET delivery_method=$1,tracking_url=$2,tracking_note=$3,status='ارسال‌شده',updated_at=NOW() WHERE id=$4 RETURNING *", [sess.deliveryMethod, link && /^https?:\/\//i.test(link) ? link : null, link && !/^https?:\/\//i.test(link) ? link : null, sess.orderId]);
+    sessions.delete(String(chatId));
     const o = r.rows[0];
     if (!o) return send(chatId, "سفارش پیدا نشد.", ADMIN);
-    if (a.status === "تحویل‌شده") {
-      await pool.query(`INSERT INTO loyalty_events(chat_id,order_id,amount) VALUES($1,$2,$3) ON CONFLICT(order_id) DO NOTHING`, [String(o.chat_id), Number(o.id), Number(o.total || o.subtotal || 0)]);
-      const loyalty = await pool.query("SELECT COUNT(*)::int AS n, COALESCE(SUM(amount),0)::bigint AS spent FROM loyalty_events WHERE chat_id=$1", [String(o.chat_id)]);
-      await send(o.chat_id, `🎉 سفارش شما تحویل شد.
-تعداد خریدهای موفق شما: ${faNum(loyalty.rows[0].n)}
-مجموع خریدهای موفق: ${money(loyalty.rows[0].spent)}
-از همراهی شما سپاسگزاریم 💚`, MAIN);
-    }
-    if (a.status === "تحویل‌شده" && !o.survey_sent) {
-      await pool.query("UPDATE orders SET survey_sent=TRUE WHERE id=$1", [id]);
-      sessions.set(String(o.chat_id), { mode: "survey", orderId: id, step: "taste", values: {} });
-      await send(o.chat_id, `🌷 امیدواریم از غذای مامان حسنا لذت برده باشید!\nلطفاً به هر مورد از ۱ تا ۵ امتیاز بدهید.\n\n۱) طعم و مزه غذا چطور بود؟`, keyboard([["۱", "۲", "۳", "۴", "۵"]]));
-      await send(chatId, `✅ سفارش #${id} تحویل‌شده ثبت شد و نظرسنجی برای مشتری ارسال شد.`, ADMIN);
-    } else {
-      await send(o.chat_id, `📦 وضعیت سفارش #${id} تغییر کرد: ${a.status}`, MAIN);
-      await send(chatId, `وضعیت سفارش #${id}: ${a.status}`, ADMIN);
-    }
-    return;
+    const message = `🚚 سفارش #${o.id} تحویل ${sess.deliveryMethod} شد.` + (o.tracking_url ? `\nلینک پیگیری: ${o.tracking_url}` : o.tracking_note ? `\nاطلاعات ارسال: ${o.tracking_note}` : "");
+    await send(o.chat_id, message, MAIN);
+    await sendAdminOrder(o.id, "🚚 سفارش ارسال‌شده");
+    return send(chatId, `✅ اطلاعات ارسال سفارش #${o.id} برای مشتری فرستاده شد.`, ADMIN);
   }
   return send(chatId, "🛠️ پنل مدیریت غذای خانگی مامان حسنا", ADMIN);
 }
@@ -358,6 +424,18 @@ async function handleMessage(msg) {
   if (sess?.mode === "survey") return handleSurvey(chatId, text, sess);
   if (await admin(chatId)) return handleAdmin(chatId, text);
 
+  if (text === "✅ تأیید فاکتور" || text === "❌ لغو سفارش") {
+    const o = (await pool.query("SELECT * FROM orders WHERE chat_id=$1 AND status='فاکتور صادر شده' ORDER BY id DESC LIMIT 1", [chatId])).rows[0];
+    if (!o) return send(chatId, "سفارش در انتظار تأیید فاکتور پیدا نشد.", MAIN);
+    if (text === "❌ لغو سفارش") {
+      await pool.query("UPDATE orders SET status='درخواست لغو مشتری',updated_at=NOW() WHERE id=$1", [o.id]);
+      if (ADMIN_ID) await send(ADMIN_ID, `⚠️ مشتری درخواست لغو سفارش #${o.id} را ثبت کرد. برای لغو نهایی از پنل مدیریت اقدام کنید.`);
+      return send(chatId, "درخواست لغو شما برای مدیریت ارسال شد.", MAIN);
+    }
+    await pool.query("UPDATE orders SET status='تأیید شده',updated_at=NOW() WHERE id=$1", [o.id]);
+    if (ADMIN_ID) await send(ADMIN_ID, `✅ مشتری فاکتور سفارش #${o.id} را تأیید کرد.`, keyboard([[`🍳 شروع آماده‌سازی #${o.id}`], [`❌ لغو سفارش #${o.id}`]]));
+    return send(chatId, `✅ فاکتور سفارش #${o.id} تأیید شد. پس از آماده‌شدن غذا به شما اطلاع می‌دهیم.`, MAIN);
+  }
   if (text === "📍 آدرس و لوکیشن ما") return send(chatId, "📍 آدرس غذای خانگی مامان حسنا:\nبوشهر، خیابان عاشوری، کوچه بهارستان ۳۷، سمت راست، مجتمع مسکونی دانش ۶\n\nنقشه: https://nshn.ir/rbEeWfOx7eoI", MAIN);
   if (text === "🕒 سفارش غذا برای فردا") {
     const ps = await getProducts();

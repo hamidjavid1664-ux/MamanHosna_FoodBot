@@ -320,7 +320,13 @@ async function handleMessage(msg) {
   if (sess?.mode === "survey") return handleSurvey(chatId, text, sess);
   if (await admin(chatId)) return handleAdmin(chatId, text);
 
-  if (text === "🍽️ مشاهده منو" || text === "🛒 ثبت سفارش") return showMenu(chatId);
+  if (text === "🍽️ مشاهده منو") return showMenu(chatId);
+  if (text === "🛒 ثبت سفارش") {
+    const products = await getProducts();
+    sessions.set(chatId, { mode: "choose_product" });
+    return send(chatId, "🛒 برای ثبت سفارش، غذای موردنظرتان را از دکمه‌های زیر انتخاب کنید:",
+      keyboard(products.map(p => [`${p.name} — ${money(p.price)} | موجودی: ${faNum(p.stock)}`]).concat([["🏠 منوی اصلی"]])));
+  }
   if (text === "📦 پیگیری سفارش") {
     const rows = (await pool.query("SELECT id,status,total,created_at FROM orders WHERE chat_id=$1 ORDER BY id DESC LIMIT 10", [chatId])).rows;
     return send(chatId, rows.length ? rows.map(o => `سفارش #${o.id}\nوضعیت: ${o.status}\nمبلغ نهایی: ${o.total == null ? "در انتظار تعیین هزینه ارسال" : money(o.total)}\nتاریخ: ${new Date(o.created_at).toLocaleString("fa-IR")}`).join("\n\n") : "هنوز سفارشی ثبت نشده است.", MAIN);
@@ -328,8 +334,9 @@ async function handleMessage(msg) {
   if (text === "📞 تماس با مامان حسنا") return send(chatId, "برای هماهنگی سفارش با مامان حسنا تماس بگیرید:\n۰۹۱۷۷۷۰۰۹۶۱\n۰۹۱۷۹۰۶۸۵۴۴", MAIN);
 
   if (sess?.mode === "choose_product") {
-    const p = (await pool.query("SELECT * FROM products WHERE name=$1", [text])).rows[0];
-    if (!p) return send(chatId, "لطفاً نام یکی از غذاهای منو را انتخاب کنید.");
+    const selectedName = text.split(" — ")[0].trim();
+    const p = (await pool.query("SELECT * FROM products WHERE name=$1", [selectedName])).rows[0];
+    if (!p) return send(chatId, "لطفاً یکی از دکمه‌های غذای منو را انتخاب کنید.");
     if (p.stock <= 0) {
       sessions.set(chatId, { mode: "preorder_product", productId: p.id });
       return send(chatId, `❌ ${p.name} فعلاً موجود نیست.\nموجودی فعلی: ۰ عدد\nاگر این غذا را برای فردا می‌خواهید، «درخواست برای فردا» را بزنید.`, keyboard([["🕒 درخواست برای فردا"], ["🍽️ مشاهده منو"]]));

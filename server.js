@@ -8,9 +8,6 @@ const PORT = process.env.PORT || 10000;
 const TOKEN = process.env.BALE_BOT_TOKEN || process.env.BOT_TOKEN;
 const ADMIN_ID = String(process.env.ADMIN_CHAT_ID || "").trim();
 const DATABASE_URL = process.env.DATABASE_URL;
-const PAYMENT_CARD = process.env.PAYMENT_CARD || "6280231395242646";
-const PAYMENT_OWNER = process.env.PAYMENT_OWNER || "خانم گرگی";
-const PAYMENT_BANK = process.env.PAYMENT_BANK || "مسکن";
 const API = TOKEN ? `https://tapi.bale.ai/bot${TOKEN}` : "";
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -60,10 +57,13 @@ function keyboard(rows) {
 }
 const MAIN = keyboard([
   ["🍽️ مشاهده منو", "🛒 ثبت سفارش"],
-  ["📦 پیگیری سفارش", "📞 تماس با مامان حسنا"]
+  ["🕒 سفارش غذا برای فردا", "📍 آدرس و لوکیشن ما"],
+  ["📦 پیگیری سفارش", "🎁 باشگاه مشتریان"],
+  ["📞 تماس با مامان حسنا"]
 ]);
 const ADMIN = keyboard([
   ["📋 موجودی غذاها", "➕ تغییر موجودی"],
+  ["💰 ویرایش قیمت غذا"],
   ["🧾 سفارش‌های جدید", "🚚 سفارش‌های در انتظار هزینه ارسال"],
   ["📦 سفارش‌های در حال آماده‌سازی", "✅ سفارش‌های آماده/ارسال"],
   ["⭐ گزارش نظرسنجی‌ها", "🕒 درخواست‌های پیش‌سفارش"],
@@ -93,7 +93,6 @@ async function initDb() {
       total INTEGER,
       status TEXT NOT NULL DEFAULT 'در انتظار تعیین هزینه ارسال',
       invoice_sent BOOLEAN NOT NULL DEFAULT FALSE,
-      payment_status TEXT NOT NULL DEFAULT 'در انتظار پرداخت',
       survey_sent BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -102,6 +101,15 @@ async function initDb() {
       id BIGSERIAL PRIMARY KEY, chat_id TEXT NOT NULL, customer_name TEXT,
       product_id TEXT NOT NULL, product_name TEXT NOT NULL, quantity INTEGER NOT NULL,
       note TEXT, status TEXT NOT NULL DEFAULT 'در انتظار بررسی', created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS loyalty_events (
+      id BIGSERIAL PRIMARY KEY, chat_id TEXT NOT NULL, order_id BIGINT UNIQUE NOT NULL,
+      amount INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS promotions (
+      id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, discount_type TEXT NOT NULL DEFAULT 'percent',
+      discount_value INTEGER NOT NULL DEFAULT 0, active BOOLEAN NOT NULL DEFAULT FALSE,
+      starts_at TIMESTAMPTZ, ends_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS surveys (
       id BIGSERIAL PRIMARY KEY, order_id BIGINT UNIQUE NOT NULL, chat_id TEXT NOT NULL,
@@ -117,7 +125,6 @@ async function initDb() {
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS subtotal INTEGER",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS total INTEGER",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_sent BOOLEAN NOT NULL DEFAULT FALSE",
-    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'در انتظار پرداخت'",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS survey_sent BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()"
   ];
@@ -167,6 +174,24 @@ async function handleAdmin(chatId, text) {
     const ps = await getProducts();
     return send(chatId, "📦 موجودی فعلی غذاها:\n\n" + ps.map(p => `${p.name}: ${faNum(p.stock)} عدد`).join("\n"), ADMIN);
   }
+  if (text === "💰 ویرایش قیمت غذا") {
+    sessions.set(String(chatId), { mode: "price_product" });
+    const ps = await getProducts();
+    return send(chatId, "غذایی را که می‌خواهید قیمتش تغییر کند انتخاب کنید:", keyboard(ps.map(p => [p.name]).concat([["🏠 منوی اصلی"]])));
+  }
+  if (sess?.mode === "price_product") {
+    const p = (await pool.query("SELECT * FROM products WHERE name=$1", [text])).rows[0];
+    if (!p) return send(chatId, "لطفاً غذا را از دکمه‌ها انتخاب کنید.", ADMIN);
+    sessions.set(String(chatId), { mode: "price_value", productId: p.id, productName: p.name });
+    return send(chatId, `قیمت جدید «${p.name}» را به تومان وارد کنید. فقط عدد؛ مثال: ۴۸۰۰۰۰`, ADMIN);
+  }
+  if (sess?.mode === "price_value") {
+    const price = Number(text.replace(/[٬,،\s]/g, ""));
+    if (!Number.isSafeInteger(price) || price < 1 || price > 100000000) return send(chatId, "قیمت معتبر به تومان وارد کنید.", ADMIN);
+    await pool.query("UPDATE products SET price=$1,updated_at=NOW() WHERE id=$2", [price, sess.productId]);
+    sessions.delete(String(chatId));
+    return send(chatId, `✅ قیمت «${sess.productName}» به ${money(price)} تغییر کرد.`, ADMIN);
+  }
   if (text === "➕ تغییر موجودی") {
     sessions.set(String(chatId), { mode: "stock_product" });
     const ps = await getProducts();
@@ -188,16 +213,6 @@ async function handleAdmin(chatId, text) {
     const rows = (await pool.query("SELECT id FROM orders WHERE status IN ('در حال آماده‌سازی','آماده ارسال','ارسال‌شده') ORDER BY id DESC LIMIT 20")).rows;
     if (!rows.length) return send(chatId, "سفارشی در این مرحله نیست.", ADMIN);
     for (const r of rows) await sendAdminOrder(r.id, "📦 پیگیری سفارش");
-    return;
-  }
-  const approveMatch = text.match(/^✅ تأیید پرداخت #(\d+)$/);
-  if (approveMatch) {
-    const id = Number(approveMatch[1]);
-    const r = await pool.query("UPDATE orders SET payment_status='پرداخت تأیید شد',status='در حال آماده‌سازی',updated_at=NOW() WHERE id=$1 RETURNING *", [id]);
-    const o = r.rows[0];
-    if (!o) return send(chatId, "سفارش پیدا نشد.", ADMIN);
-    await send(o.chat_id, `✅ پرداخت سفارش #${id} توسط مدیریت تأیید شد.\nسفارش شما در صف آماده‌سازی قرار گرفت.`, MAIN);
-    await send(chatId, `پرداخت سفارش #${id} تأیید شد.`, ADMIN);
     return;
   }
   if (text === "⭐ گزارش نظرسنجی‌ها") {
@@ -238,10 +253,8 @@ async function handleAdmin(chatId, text) {
     const o = result.rows[0];
     if (!o) return send(chatId, "این شماره سفارش پیدا نشد.", ADMIN);
     const items = Array.isArray(o.items) ? o.items : JSON.parse(o.items);
-    const paymentText = `\n\n💳 پرداخت کارت‌به‌کارت\n🏦 بانک ${PAYMENT_BANK}\nشماره کارت: ${PAYMENT_CARD.replace(/(\d{4})(?=\d)/g, "$1 ")}\nبه نام: ${PAYMENT_OWNER}\n\nپس از واریز، تصویر یا فایل رسید را همین‌جا ارسال کنید. تأیید پرداخت پس از بررسی مدیریت انجام می‌شود.`;
-    sessions.set(String(o.chat_id), { mode: "awaiting_receipt", orderId: Number(o.id) });
-    await send(o.chat_id, orderSummary(o, items, fee) + paymentText, MAIN);
-    await send(chatId, `✅ فاکتور و اطلاعات کارت برای سفارش #${o.id} ارسال شد.\nمبلغ نهایی: ${money(o.total)}`, ADMIN);
+    await send(o.chat_id, orderSummary(o, items, fee) + "\n\nلطفاً برای تأیید فاکتور با مامان حسنا هماهنگ کنید.", MAIN);
+    await send(chatId, `✅ فاکتور سفارش #${o.id} برای مشتری ارسال شد.\nمبلغ نهایی: ${money(o.total)}`, ADMIN);
     return;
   }
   const statusActions = [
@@ -256,6 +269,14 @@ async function handleAdmin(chatId, text) {
     const r = await pool.query("UPDATE orders SET status=$1,updated_at=NOW() WHERE id=$2 RETURNING *", [a.status, id]);
     const o = r.rows[0];
     if (!o) return send(chatId, "سفارش پیدا نشد.", ADMIN);
+    if (a.status === "تحویل‌شده") {
+      await pool.query(`INSERT INTO loyalty_events(chat_id,order_id,amount) VALUES($1,$2,$3) ON CONFLICT(order_id) DO NOTHING`, [String(o.chat_id), Number(o.id), Number(o.total || o.subtotal || 0)]);
+      const loyalty = await pool.query("SELECT COUNT(*)::int AS n, COALESCE(SUM(amount),0)::bigint AS spent FROM loyalty_events WHERE chat_id=$1", [String(o.chat_id)]);
+      await send(o.chat_id, `🎉 سفارش شما تحویل شد.
+تعداد خریدهای موفق شما: ${faNum(loyalty.rows[0].n)}
+مجموع خریدهای موفق: ${money(loyalty.rows[0].spent)}
+از همراهی شما سپاسگزاریم 💚`, MAIN);
+    }
     if (a.status === "تحویل‌شده" && !o.survey_sent) {
       await pool.query("UPDATE orders SET survey_sent=TRUE WHERE id=$1", [id]);
       sessions.set(String(o.chat_id), { mode: "survey", orderId: id, step: "taste", values: {} });
@@ -320,29 +341,14 @@ async function handleSurvey(chatId, text, session) {
 async function handleMessage(msg) {
   if (!msg?.chat?.id) return;
   const chatId = String(msg.chat.id);
-  const text = String(msg.text || msg.caption || "").trim();
+  const text = String(msg.text || "").trim();
+  if (!text) return;
   const name = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ");
   await pool.query(
     `INSERT INTO customers(chat_id,name,updated_at) VALUES($1,$2,NOW())
      ON CONFLICT(chat_id) DO UPDATE SET name=COALESCE(NULLIF(EXCLUDED.name,''),customers.name),updated_at=NOW()`,
     [chatId, name || null]
   );
-
-  const hasReceipt = Array.isArray(msg.photo) && msg.photo.length > 0 || !!msg.document;
-  if (hasReceipt && !await admin(chatId)) {
-    const sessReceipt = sessions.get(chatId);
-    if (!sessReceipt || sessReceipt.mode !== "awaiting_receipt") {
-      return send(chatId, "برای ارسال رسید، ابتدا باید فاکتور و اطلاعات پرداخت سفارش برایتان ارسال شده باشد.", MAIN);
-    }
-    if (!ADMIN_ID) return send(chatId, "در حال حاضر دریافت رسید در دسترس نیست. لطفاً با مدیریت تماس بگیرید.", MAIN);
-    await pool.query("UPDATE orders SET payment_status='رسید دریافت شد؛ در انتظار بررسی',updated_at=NOW() WHERE id=$1 AND chat_id=$2", [sessReceipt.orderId, chatId]);
-    await send(ADMIN_ID, `🧾 رسید پرداخت سفارش #${sessReceipt.orderId} دریافت شد.\nمشتری: ${name || "نامشخص"}\nشناسه بله: ${chatId}\nمبلغ فاکتور: از بخش سفارش‌ها بررسی شود.\nپس از بررسی، دکمه تأیید پرداخت را بزنید.`, keyboard([[`✅ تأیید پرداخت #${sessReceipt.orderId}`], ["🧾 سفارش‌های جدید"], ["🏠 منوی اصلی"]]));
-    try { await bale("forwardMessage", { chat_id: ADMIN_ID, from_chat_id: chatId, message_id: msg.message_id }); }
-    catch (e) { console.error("Receipt forwarding failed:", e.message); await send(ADMIN_ID, "⚠️ انتقال خودکار فایل رسید ناموفق بود؛ لطفاً رسید را از گفت‌وگوی مشتری بررسی کنید."); }
-    await send(chatId, `✅ رسید سفارش #${sessReceipt.orderId} دریافت شد. پس از بررسی مدیریت، نتیجه برایتان ارسال می‌شود.`, MAIN);
-    return;
-  }
-  if (!text) return;
 
   if (text === "/start" || text === "🏠 منوی اصلی") {
     sessions.delete(chatId);
@@ -352,12 +358,22 @@ async function handleMessage(msg) {
   if (sess?.mode === "survey") return handleSurvey(chatId, text, sess);
   if (await admin(chatId)) return handleAdmin(chatId, text);
 
+  if (text === "📍 آدرس و لوکیشن ما") return send(chatId, "📍 آدرس غذای خانگی مامان حسنا:\nبوشهر، خیابان عاشوری، کوچه بهارستان ۳۷، سمت راست، مجتمع مسکونی دانش ۶\n\nنقشه: https://nshn.ir/rbEeWfOx7eoI", MAIN);
+  if (text === "🕒 سفارش غذا برای فردا") {
+    const ps = await getProducts();
+    sessions.set(chatId, { mode: "choose_preorder_product" });
+    return send(chatId, "🕒 سفارش برای فردا\nغذای موردنظر را انتخاب کنید. این درخواست پس از تأیید مدیریت قطعی می‌شود:", keyboard(ps.map(p => [p.name]).concat([["🏠 منوی اصلی"]])));
+  }
   if (text === "🍽️ مشاهده منو") return showMenu(chatId);
   if (text === "🛒 ثبت سفارش") {
     const products = await getProducts();
     sessions.set(chatId, { mode: "choose_product" });
     return send(chatId, "🛒 برای ثبت سفارش، غذای موردنظرتان را از دکمه‌های زیر انتخاب کنید:",
       keyboard(products.map(p => [`${p.name} — ${money(p.price)} | موجودی: ${faNum(p.stock)}`]).concat([["🏠 منوی اصلی"]])));
+  }
+  if (text === "🎁 باشگاه مشتریان") {
+    const r = await pool.query("SELECT COUNT(*)::int AS n, COALESCE(SUM(amount),0)::bigint AS spent FROM loyalty_events WHERE chat_id=$1", [chatId]);
+    return send(chatId, `🎁 باشگاه مشتریان\nخریدهای موفق: ${faNum(r.rows[0].n)}\nمجموع خریدهای موفق: ${money(r.rows[0].spent)}\nبرای استفاده از تخفیف‌های آینده همراه ما باشید 💚`, MAIN);
   }
   if (text === "📦 پیگیری سفارش") {
     const rows = (await pool.query("SELECT id,status,total,created_at FROM orders WHERE chat_id=$1 ORDER BY id DESC LIMIT 10", [chatId])).rows;

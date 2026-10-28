@@ -8,6 +8,9 @@ const PORT = process.env.PORT || 10000;
 const TOKEN = process.env.BALE_BOT_TOKEN || process.env.BOT_TOKEN;
 const ADMIN_ID = String(process.env.ADMIN_CHAT_ID || "").trim();
 const DATABASE_URL = process.env.DATABASE_URL;
+const PAYMENT_CARD = process.env.PAYMENT_CARD || "6280231395242646";
+const PAYMENT_OWNER = process.env.PAYMENT_OWNER || "خانم گرگی";
+const PAYMENT_BANK = process.env.PAYMENT_BANK || "مسکن";
 const API = TOKEN ? `https://tapi.bale.ai/bot${TOKEN}` : "";
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -90,6 +93,7 @@ async function initDb() {
       total INTEGER,
       status TEXT NOT NULL DEFAULT 'در انتظار تعیین هزینه ارسال',
       invoice_sent BOOLEAN NOT NULL DEFAULT FALSE,
+      payment_status TEXT NOT NULL DEFAULT 'در انتظار پرداخت',
       survey_sent BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -113,6 +117,7 @@ async function initDb() {
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS subtotal INTEGER",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS total INTEGER",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_sent BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'در انتظار پرداخت'",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS survey_sent BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()"
   ];
@@ -185,6 +190,16 @@ async function handleAdmin(chatId, text) {
     for (const r of rows) await sendAdminOrder(r.id, "📦 پیگیری سفارش");
     return;
   }
+  const approveMatch = text.match(/^✅ تأیید پرداخت #(\d+)$/);
+  if (approveMatch) {
+    const id = Number(approveMatch[1]);
+    const r = await pool.query("UPDATE orders SET payment_status='پرداخت تأیید شد',status='در حال آماده‌سازی',updated_at=NOW() WHERE id=$1 RETURNING *", [id]);
+    const o = r.rows[0];
+    if (!o) return send(chatId, "سفارش پیدا نشد.", ADMIN);
+    await send(o.chat_id, `✅ پرداخت سفارش #${id} توسط مدیریت تأیید شد.\nسفارش شما در صف آماده‌سازی قرار گرفت.`, MAIN);
+    await send(chatId, `پرداخت سفارش #${id} تأیید شد.`, ADMIN);
+    return;
+  }
   if (text === "⭐ گزارش نظرسنجی‌ها") {
     const r = await pool.query(`SELECT COUNT(*) AS n, ROUND(AVG(overall),2) AS avg_overall,
       ROUND(AVG(taste),2) AS avg_taste, ROUND(AVG(ingredients),2) AS avg_ingredients,
@@ -223,8 +238,10 @@ async function handleAdmin(chatId, text) {
     const o = result.rows[0];
     if (!o) return send(chatId, "این شماره سفارش پیدا نشد.", ADMIN);
     const items = Array.isArray(o.items) ? o.items : JSON.parse(o.items);
-    await send(o.chat_id, orderSummary(o, items, fee) + "\n\nلطفاً برای تأیید فاکتور با مامان حسنا هماهنگ کنید.", MAIN);
-    await send(chatId, `✅ فاکتور سفارش #${o.id} برای مشتری ارسال شد.\nمبلغ نهایی: ${money(o.total)}`, ADMIN);
+    const paymentText = `\n\n💳 پرداخت کارت‌به‌کارت\n🏦 بانک ${PAYMENT_BANK}\nشماره کارت: ${PAYMENT_CARD.replace(/(\d{4})(?=\d)/g, "$1 ")}\nبه نام: ${PAYMENT_OWNER}\n\nپس از واریز، تصویر یا فایل رسید را همین‌جا ارسال کنید. تأیید پرداخت پس از بررسی مدیریت انجام می‌شود.`;
+    sessions.set(String(o.chat_id), { mode: "awaiting_receipt", orderId: Number(o.id) });
+    await send(o.chat_id, orderSummary(o, items, fee) + paymentText, MAIN);
+    await send(chatId, `✅ فاکتور و اطلاعات کارت برای سفارش #${o.id} ارسال شد.\nمبلغ نهایی: ${money(o.total)}`, ADMIN);
     return;
   }
   const statusActions = [
@@ -303,14 +320,29 @@ async function handleSurvey(chatId, text, session) {
 async function handleMessage(msg) {
   if (!msg?.chat?.id) return;
   const chatId = String(msg.chat.id);
-  const text = String(msg.text || "").trim();
-  if (!text) return;
+  const text = String(msg.text || msg.caption || "").trim();
   const name = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ");
   await pool.query(
     `INSERT INTO customers(chat_id,name,updated_at) VALUES($1,$2,NOW())
      ON CONFLICT(chat_id) DO UPDATE SET name=COALESCE(NULLIF(EXCLUDED.name,''),customers.name),updated_at=NOW()`,
     [chatId, name || null]
   );
+
+  const hasReceipt = Array.isArray(msg.photo) && msg.photo.length > 0 || !!msg.document;
+  if (hasReceipt && !await admin(chatId)) {
+    const sessReceipt = sessions.get(chatId);
+    if (!sessReceipt || sessReceipt.mode !== "awaiting_receipt") {
+      return send(chatId, "برای ارسال رسید، ابتدا باید فاکتور و اطلاعات پرداخت سفارش برایتان ارسال شده باشد.", MAIN);
+    }
+    if (!ADMIN_ID) return send(chatId, "در حال حاضر دریافت رسید در دسترس نیست. لطفاً با مدیریت تماس بگیرید.", MAIN);
+    await pool.query("UPDATE orders SET payment_status='رسید دریافت شد؛ در انتظار بررسی',updated_at=NOW() WHERE id=$1 AND chat_id=$2", [sessReceipt.orderId, chatId]);
+    await send(ADMIN_ID, `🧾 رسید پرداخت سفارش #${sessReceipt.orderId} دریافت شد.\nمشتری: ${name || "نامشخص"}\nشناسه بله: ${chatId}\nمبلغ فاکتور: از بخش سفارش‌ها بررسی شود.\nپس از بررسی، دکمه تأیید پرداخت را بزنید.`, keyboard([[`✅ تأیید پرداخت #${sessReceipt.orderId}`], ["🧾 سفارش‌های جدید"], ["🏠 منوی اصلی"]]));
+    try { await bale("forwardMessage", { chat_id: ADMIN_ID, from_chat_id: chatId, message_id: msg.message_id }); }
+    catch (e) { console.error("Receipt forwarding failed:", e.message); await send(ADMIN_ID, "⚠️ انتقال خودکار فایل رسید ناموفق بود؛ لطفاً رسید را از گفت‌وگوی مشتری بررسی کنید."); }
+    await send(chatId, `✅ رسید سفارش #${sessReceipt.orderId} دریافت شد. پس از بررسی مدیریت، نتیجه برایتان ارسال می‌شود.`, MAIN);
+    return;
+  }
+  if (!text) return;
 
   if (text === "/start" || text === "🏠 منوی اصلی") {
     sessions.delete(chatId);

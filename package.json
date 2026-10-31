@@ -10,5 +10,7 @@ node	">=18"
 dependencies	
 express	"^5.1.0"
 pg	"^8.16.3"
-dependencies
-express
+"dependencies": {
+  "express": "^5.1.0",
+  "pg": "^8.16.3"
+}

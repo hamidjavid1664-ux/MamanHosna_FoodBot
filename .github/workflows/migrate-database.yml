@@ -10,6 +10,7 @@ permissions:
 jobs:
   migrate:
     runs-on: ubuntu-latest
+
     steps:
       - name: Install PostgreSQL 18 tools
         run: |
@@ -23,7 +24,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client-18
 
-      
       - name: Export Render database
         env:
           RENDER_DATABASE_URL: ${{ secrets.RENDER_DATABASE_URL }}
@@ -34,13 +34,6 @@ jobs:
             --no-owner \
             --no-acl \
             --file=render-backup.dump
-
-      - name: Save backup file
-        uses: actions/upload-artifact@v4
-        with:
-          name: maman-hosna-render-backup
-          path: render-backup.dump
-          retention-days: 7
 
       - name: Prepare restore list
         run: |

@@ -37,7 +37,7 @@ jobs:
             - name: Prepare restore list
         run: |
           pg_restore --list render-backup.dump \
-            | grep -vE ' SCHEMA - public$' \
+           | grep -vE ' SCHEMA - public( |$)' \
             > restore-list.txt
 
       - name: Import into Supabase

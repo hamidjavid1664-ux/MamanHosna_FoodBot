@@ -34,12 +34,19 @@ jobs:
             --no-acl \
             --file=render-backup.dump
 
+            - name: Prepare restore list
+        run: |
+          pg_restore --list render-backup.dump \
+            | grep -vE ' SCHEMA - public$' \
+            > restore-list.txt
+
       - name: Import into Supabase
         env:
           SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
         run: |
           test -n "$SUPABASE_DATABASE_URL"
           pg_restore \
+            --use-list=restore-list.txt \
             --no-owner \
             --no-acl \
             --exit-on-error \

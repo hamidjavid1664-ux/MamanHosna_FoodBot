@@ -56,10 +56,10 @@ function keyboard(rows) {
   return { keyboard: rows.map(r => r.map(text => ({ text }))), resize_keyboard: true, one_time_keyboard: false, is_persistent: true };
 }
 const MAIN = keyboard([
-  ["🍽️ مشاهده منو", "🛒 ثبت سفارش"],
-  ["🕒 سفارش غذا برای فردا", "📍 آدرس و لوکیشن ما"],
-  ["📦 پیگیری سفارش", "🎁 باشگاه مشتریان"],
-  ["📞 تماس با مامان حسنا"]
+  ["🛒 شروع سفارش", "🍽️ منوی غذاها"],
+  ["🧺 سبد خرید", "📦 پیگیری سفارش"],
+  ["🕒 پیش‌سفارش فردا", "🎁 باشگاه مشتریان"],
+  ["📍 آدرس ما", "📞 تماس با مامان حسنا"]
 ]);
 const ADMIN = keyboard([
   ["📋 موجودی غذاها", "➕ تغییر موجودی"],
@@ -150,11 +150,37 @@ async function getProducts() {
 async function showMenu(chatId) {
   const products = await getProducts();
   const lines = products.map(p =>
-    `${p.name}\n💰 ${money(p.price)}\n📦 موجودی: ${p.stock > 0 ? `${faNum(p.stock)} عدد` : "۰ — فعلاً موجود نیست"}`
+    `${p.name}\n💰 ${money(p.price)}\n📦 ${p.stock > 0 ? `${faNum(p.stock)} عدد موجود` : "فعلاً ناموجود — امکان درخواست برای فردا"}`
   );
   await send(chatId, "🍲 منوی غذای خانگی مامان حسنا\n\n" + lines.join("\n\n") +
     "\n\nبرای سفارش، دکمه «🛒 ثبت سفارش» را بزنید.", MAIN);
 }
+
+function cartKeyboard(products, cart) {
+  const rows = [];
+  for (const p of products) {
+    const qty = Number(cart[p.id] || 0);
+    rows.push([`${p.name} | ${money(p.price)} | انتخاب: ${faNum(qty)}`]);
+  }
+  rows.push(["🧺 مشاهده سبد خرید", "✅ ادامه و ثبت سفارش"]);
+  rows.push(["🏠 منوی اصلی"]);
+  return keyboard(rows);
+}
+async function showCart(chatId, cart) {
+  const ids = Object.keys(cart || {}).filter(id => Number(cart[id]) > 0);
+  if (!ids.length) return send(chatId, "🧺 سبد خرید شما خالی است. از منوی غذاها، غذای دلخواهتان را انتخاب کنید.", MAIN);
+  const products = (await pool.query("SELECT * FROM products WHERE id = ANY($1::text[])", [ids])).rows;
+  const byId = new Map(products.map(p => [p.id, p]));
+  const items = ids.map(id => ({ p: byId.get(id), qty: Number(cart[id]) })).filter(x => x.p);
+  const total = items.reduce((s, x) => s + Number(x.p.price) * x.qty, 0);
+  const lines = items.map(x => `• ${x.p.name} × ${faNum(x.qty)} = ${money(Number(x.p.price) * x.qty)}`);
+  return send(chatId, `🧺 سبد خرید شما\n\n${lines.join("\n")}\n\nجمع غذاها: ${money(total)}\n\nبرای اصلاح تعداد، روی نام غذا در منو بزنید.`, keyboard([
+    ["🍽️ ادامه انتخاب غذا", "🧹 خالی کردن سبد"],
+    ["✅ ادامه و ثبت سفارش"],
+    ["🏠 منوی اصلی"]
+  ]));
+}
+
 function orderSummary(order, items, delivery = order.delivery_fee) {
   const itemLines = items.map(i => `• ${i.name} × ${faNum(i.quantity)} = ${money(i.unit_price * i.quantity)}`).join("\n");
   const subtotal = Number(order.subtotal ?? items.reduce((sum, i) => sum + i.unit_price * i.quantity, 0));
@@ -404,12 +430,24 @@ async function handleSurvey(chatId, text, session) {
   return send(chatId, "اگر توضیح یا پیشنهادی دارید بنویسید؛ یا برای رد کردن این مرحله «بدون نظر» را بزنید.", keyboard([["بدون نظر"]]));
 }
 
+
 async function handleMessage(msg) {
   if (!msg?.chat?.id) return;
   const chatId = String(msg.chat.id);
   const text = String(msg.text || "").trim();
-  if (!text) return;
   const name = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ");
+
+  if (msg.contact?.phone_number) {
+    const s = sessions.get(chatId);
+    if (s?.mode === "contact_phone") {
+      s.phone = String(msg.contact.phone_number).replace(/\s/g, "");
+      s.mode = "contact_address";
+      sessions.set(chatId, s);
+      return send(chatId, "📍 نشانی کامل تحویل را بنویسید. اگر امکان دارد، پلاک و واحد را هم ذکر کنید.", keyboard([["❌ انصراف"], ["🏠 منوی اصلی"]]));
+    }
+  }
+  if (!text) return;
+
   await pool.query(
     `INSERT INTO customers(chat_id,name,updated_at) VALUES($1,$2,NOW())
      ON CONFLICT(chat_id) DO UPDATE SET name=COALESCE(NULLIF(EXCLUDED.name,''),customers.name),updated_at=NOW()`,
@@ -418,166 +456,200 @@ async function handleMessage(msg) {
 
   if (text === "/start" || text === "🏠 منوی اصلی") {
     sessions.delete(chatId);
-    return send(chatId, await admin(chatId) ? "🍲 پنل مدیریت غذای خانگی مامان حسنا" : "🍲💚 به غذای خانگی مامان حسنا خوش آمدید!\nغذاهای خانگی با عشق و سلیقه؛ برای دیدن منو و موجودی از دکمه زیر استفاده کنید.", await admin(chatId) ? ADMIN : MAIN);
+    return send(chatId,
+      await admin(chatId)
+        ? "🍲 پنل مدیریت غذای خانگی مامان حسنا"
+        : "🍲💚 به غذای خانگی مامان حسنا خوش آمدید!\n\nبرای سفارش، غذاها را انتخاب کنید، تعداد هرکدام را با دکمه‌ها مشخص کنید و همه را یک‌جا در سبد خرید ثبت کنید.",
+      await admin(chatId) ? ADMIN : MAIN
+    );
   }
+
   const sess = sessions.get(chatId);
   if (sess?.mode === "survey") return handleSurvey(chatId, text, sess);
   if (await admin(chatId)) return handleAdmin(chatId, text);
 
+  if (text === "❌ انصراف") {
+    sessions.delete(chatId);
+    return send(chatId, "عملیات لغو شد.", MAIN);
+  }
+
+  if (text === "🍽️ منوی غذاها" || text === "🛒 شروع سفارش" || text === "🍽️ ادامه انتخاب غذا") {
+    const products = await getProducts();
+    const cart = sess?.cart || {};
+    sessions.set(chatId, { mode: "cart", cart });
+    return send(chatId, "🍽️ غذای موردنظرتان را انتخاب کنید. با انتخاب هر غذا، تعداد آن یک عدد زیاد می‌شود. برای کم‌کردن تعداد، همان غذا را دوباره از دکمه اصلاح تعداد در سبد مدیریت کنید.", cartKeyboard(products, cart));
+  }
+
+  if (text === "🧺 سبد خرید" || text === "🧺 مشاهده سبد خرید") {
+    return showCart(chatId, sess?.cart || {});
+  }
+
+  if (text === "🧹 خالی کردن سبد") {
+    sessions.set(chatId, { mode: "cart", cart: {} });
+    return send(chatId, "سبد خرید خالی شد. می‌توانید غذاهای دیگری انتخاب کنید.", MAIN);
+  }
+
+  if (text === "🕒 پیش‌سفارش فردا" || text === "🕒 سفارش غذا برای فردا") {
+    const ps = await getProducts();
+    sessions.set(chatId, { mode: "choose_preorder_product" });
+    return send(chatId, "🕒 غذای موردنظر برای فردا را انتخاب کنید. این درخواست پس از هماهنگی و تأیید مدیریت قطعی می‌شود:",
+      keyboard(ps.map(p => [`${p.name} | ${money(p.price)}`]).concat([["🏠 منوی اصلی"]])));
+  }
+
+  if (text === "📍 آدرس ما" || text === "📍 آدرس و لوکیشن ما") {
+    return send(chatId, "📍 آدرس غذای خانگی مامان حسنا:\nبوشهر، خیابان عاشوری، کوچه بهارستان ۳۷، سمت راست، مجتمع مسکونی دانش ۶\n\nنقشه: https://nshn.ir/rbEeWfOx7eoI", MAIN);
+  }
+  if (text === "📞 تماس با مامان حسنا") return send(chatId, "برای هماهنگی سفارش با مامان حسنا تماس بگیرید:\n۰۹۱۷۷۷۰۰۹۶۱\n۰۹۱۷۹۰۶۸۵۴۴", MAIN);
+
+  if (text === "🎁 باشگاه مشتریان") {
+    const r = await pool.query("SELECT COUNT(*)::int AS n, COALESCE(SUM(amount),0)::bigint AS spent FROM loyalty_events WHERE chat_id=$1", [chatId]);
+    return send(chatId, `🎁 باشگاه مشتریان\nخریدهای موفق: ${faNum(r.rows[0].n)}\nمجموع خریدهای موفق: ${money(r.rows[0].spent)}\nاز همراهی شما سپاسگزاریم 💚`, MAIN);
+  }
+
+  if (text === "📦 پیگیری سفارش") {
+    const rows = (await pool.query("SELECT id,status,total,created_at FROM orders WHERE chat_id=$1 ORDER BY id DESC LIMIT 10", [chatId])).rows;
+    return send(chatId, rows.length
+      ? rows.map(o => `سفارش #${o.id}\nوضعیت: ${o.status}\nمبلغ نهایی: ${o.total == null ? "در انتظار تعیین هزینه ارسال" : money(o.total)}\nتاریخ: ${new Date(o.created_at).toLocaleString("fa-IR")}`).join("\n\n")
+      : "هنوز سفارشی ثبت نشده است.", MAIN);
+  }
+
   if (text === "✅ تأیید فاکتور" || text === "❌ لغو سفارش") {
     const o = (await pool.query("SELECT * FROM orders WHERE chat_id=$1 AND status='فاکتور صادر شده' ORDER BY id DESC LIMIT 1", [chatId])).rows[0];
-    if (!o) return send(chatId, "سفارش در انتظار تأیید فاکتور پیدا نشد.", MAIN);
+    if (!o) return send(chatId, "سفارشی در انتظار تأیید فاکتور پیدا نشد.", MAIN);
     if (text === "❌ لغو سفارش") {
       await pool.query("UPDATE orders SET status='درخواست لغو مشتری',updated_at=NOW() WHERE id=$1", [o.id]);
-      if (ADMIN_ID) await send(ADMIN_ID, `⚠️ مشتری درخواست لغو سفارش #${o.id} را ثبت کرد. برای لغو نهایی از پنل مدیریت اقدام کنید.`);
+      if (ADMIN_ID) await send(ADMIN_ID, `⚠️ مشتری درخواست لغو سفارش #${o.id} را ثبت کرد.`);
       return send(chatId, "درخواست لغو شما برای مدیریت ارسال شد.", MAIN);
     }
     await pool.query("UPDATE orders SET status='تأیید شده',updated_at=NOW() WHERE id=$1", [o.id]);
     if (ADMIN_ID) await send(ADMIN_ID, `✅ مشتری فاکتور سفارش #${o.id} را تأیید کرد.`, keyboard([[`🍳 شروع آماده‌سازی #${o.id}`], [`❌ لغو سفارش #${o.id}`]]));
-    return send(chatId, `✅ فاکتور سفارش #${o.id} تأیید شد. پس از آماده‌شدن غذا به شما اطلاع می‌دهیم.`, MAIN);
+    return send(chatId, `✅ فاکتور سفارش #${o.id} تأیید شد. پس از آماده‌شدن غذا اطلاع می‌دهیم.`, MAIN);
   }
-  if (text === "📍 آدرس و لوکیشن ما") return send(chatId, "📍 آدرس غذای خانگی مامان حسنا:\nبوشهر، خیابان عاشوری، کوچه بهارستان ۳۷، سمت راست، مجتمع مسکونی دانش ۶\n\nنقشه: https://nshn.ir/rbEeWfOx7eoI", MAIN);
-  if (text === "🕒 سفارش غذا برای فردا") {
-    const ps = await getProducts();
-    sessions.set(chatId, { mode: "choose_preorder_product" });
-    return send(chatId, "🕒 سفارش برای فردا\nغذای موردنظر را انتخاب کنید. این درخواست پس از تأیید مدیریت قطعی می‌شود:", keyboard(ps.map(p => [p.name]).concat([["🏠 منوی اصلی"]])));
-  }
-  if (text === "🍽️ مشاهده منو") return showMenu(chatId);
-  if (text === "🛒 ثبت سفارش") {
-    const products = await getProducts();
-    sessions.set(chatId, { mode: "choose_product" });
-    return send(chatId, "🛒 برای ثبت سفارش، غذای موردنظرتان را از دکمه‌های زیر انتخاب کنید:",
-      keyboard(products.map(p => [`${p.name} — ${money(p.price)} | موجودی: ${faNum(p.stock)}`]).concat([["🏠 منوی اصلی"]])));
-  }
-  if (text === "🎁 باشگاه مشتریان") {
-    const r = await pool.query("SELECT COUNT(*)::int AS n, COALESCE(SUM(amount),0)::bigint AS spent FROM loyalty_events WHERE chat_id=$1", [chatId]);
-    return send(chatId, `🎁 باشگاه مشتریان\nخریدهای موفق: ${faNum(r.rows[0].n)}\nمجموع خریدهای موفق: ${money(r.rows[0].spent)}\nبرای استفاده از تخفیف‌های آینده همراه ما باشید 💚`, MAIN);
-  }
-  if (text === "📦 پیگیری سفارش") {
-    const rows = (await pool.query("SELECT id,status,total,created_at FROM orders WHERE chat_id=$1 ORDER BY id DESC LIMIT 10", [chatId])).rows;
-    return send(chatId, rows.length ? rows.map(o => `سفارش #${o.id}\nوضعیت: ${o.status}\nمبلغ نهایی: ${o.total == null ? "در انتظار تعیین هزینه ارسال" : money(o.total)}\nتاریخ: ${new Date(o.created_at).toLocaleString("fa-IR")}`).join("\n\n") : "هنوز سفارشی ثبت نشده است.", MAIN);
-  }
-  if (text === "📞 تماس با مامان حسنا") return send(chatId, "برای هماهنگی سفارش با مامان حسنا تماس بگیرید:\n۰۹۱۷۷۷۰۰۹۶۱\n۰۹۱۷۹۰۶۸۵۴۴", MAIN);
 
-  if (sess?.mode === "choose_product") {
-    const selectedName = text.split(" — ")[0].trim();
-    const p = (await pool.query("SELECT * FROM products WHERE name=$1", [selectedName])).rows[0];
-    if (!p) return send(chatId, "لطفاً یکی از دکمه‌های غذای منو را انتخاب کنید.");
-    if (p.stock <= 0) {
-      sessions.set(chatId, { mode: "preorder_product", productId: p.id });
-      return send(chatId, `❌ ${p.name} فعلاً موجود نیست.\nموجودی فعلی: ۰ عدد\nاگر این غذا را برای فردا می‌خواهید، «درخواست برای فردا» را بزنید.`, keyboard([["🕒 درخواست برای فردا"], ["🍽️ مشاهده منو"]]));
+  if (sess?.mode === "cart") {
+    const products = await getProducts();
+    const editMatch = text.match(/^(➖|➕) (.+)$/);
+    if (editMatch) {
+      const p = products.find(x => x.name === editMatch[2]);
+      if (!p) return showCart(chatId, sess.cart || {});
+      const cart = { ...(sess.cart || {}) };
+      const current = Number(cart[p.id] || 0);
+      if (editMatch[1] === "➖") {
+        if (current <= 1) delete cart[p.id]; else cart[p.id] = current - 1;
+      } else {
+        if (current >= Number(p.stock)) return send(chatId, `موجودی «${p.name}» فقط ${faNum(p.stock)} عدد است.`, keyboard([["🧺 مشاهده سبد خرید"], ["🏠 منوی اصلی"]]));
+        cart[p.id] = current + 1;
+      }
+      sessions.set(chatId, { mode: "cart", cart });
+      return showCart(chatId, cart);
     }
-    sessions.set(chatId, { mode: "quantity", productId: p.id });
-    return send(chatId, `${p.name}\nقیمت هر پرس: ${money(p.price)}\nموجودی: ${faNum(p.stock)} عدد\nچند عدد می‌خواهید؟`);
+    const chosen = products.find(p => text.startsWith(p.name + " |"));
+    if (chosen) {
+      if (Number(chosen.stock) <= 0) {
+        sessions.set(chatId, { ...sess, mode: "cart", pendingPreorder: chosen.id });
+        return send(chatId, `❌ ${chosen.name} فعلاً موجود نیست.\nمی‌توانید برای فردا درخواست ثبت کنید.`, keyboard([["🕒 درخواست همین غذا برای فردا"], ["🍽️ ادامه انتخاب غذا"], ["🧺 سبد خرید"]]));
+      }
+      const cart = { ...(sess.cart || {}) };
+      const nextQty = Number(cart[chosen.id] || 0) + 1;
+      if (nextQty > Number(chosen.stock)) return send(chatId, `از «${chosen.name}» فقط ${faNum(chosen.stock)} عدد موجود است.`, cartKeyboard(products, cart));
+      cart[chosen.id] = nextQty;
+      sessions.set(chatId, { mode: "cart", cart });
+      return send(chatId, `➕ یک عدد «${chosen.name}» به سبد اضافه شد.\nتعداد در سبد: ${faNum(nextQty)}`, cartKeyboard(products, cart));
+    }
+    if (text === "🕒 درخواست همین غذا برای فردا" && sess.pendingPreorder) {
+      const p = products.find(x => x.id === sess.pendingPreorder);
+      sessions.set(chatId, { mode: "preorder_quantity", productId: p.id });
+      return send(chatId, `چند عدد «${p.name}» برای فردا می‌خواهید؟ عدد را وارد کنید.`);
+    }
+    if (text === "✅ ادامه و ثبت سفارش") {
+      const ids = Object.keys(sess.cart || {}).filter(id => Number(sess.cart[id]) > 0);
+      if (!ids.length) return send(chatId, "سبد خرید خالی است. ابتدا غذا انتخاب کنید.", cartKeyboard(products, sess.cart || {}));
+      sessions.set(chatId, { mode: "contact_phone", cart: sess.cart });
+      const contactKb = { keyboard: [[{ text: "📱 ارسال شماره تماس", request_contact: true }], [{ text: "❌ انصراف" }, { text: "🏠 منوی اصلی" }]], resize_keyboard: true, one_time_keyboard: false };
+      return send(chatId, "📱 برای ثبت سفارش، شماره تماس را با دکمه زیر ارسال کنید؛ یا شماره را به‌صورت دستی بنویسید.", contactKb);
+    }
+    if (text === "🧺 مشاهده سبد خرید") return showCart(chatId, sess.cart || {});
+    return send(chatId, "از دکمه‌های منو استفاده کنید.", cartKeyboard(products, sess.cart || {}));
   }
-  if (sess?.mode === "preorder_product" && text === "🕒 درخواست برای فردا") {
-    const p = (await pool.query("SELECT * FROM products WHERE id=$1", [sess.productId])).rows[0];
+
+  if (sess?.mode === "contact_phone") {
+    const phone = text.replace(/\s/g, "");
+    if (!/^[+0-9۰-۹-]{8,18}$/.test(phone)) return send(chatId, "شماره تماس معتبر وارد کنید یا از دکمه ارسال شماره استفاده کنید.");
+    sessions.set(chatId, { ...sess, mode: "contact_address", phone });
+    return send(chatId, "📍 حالا نشانی کامل تحویل غذا را بنویسید. لطفاً پلاک و واحد را هم ذکر کنید.", keyboard([["❌ انصراف"], ["🏠 منوی اصلی"]]));
+  }
+
+  if (sess?.mode === "contact_address") {
+    if (text.length < 8) return send(chatId, "لطفاً نشانی کامل‌تری وارد کنید.");
+    const client = await pool.connect();
+    let order;
+    let items = [];
+    try {
+      await client.query("BEGIN");
+      const ids = Object.keys(sess.cart || {}).filter(id => Number(sess.cart[id]) > 0);
+      if (!ids.length) throw new Error("سبد خرید خالی است");
+      const locked = (await client.query("SELECT * FROM products WHERE id = ANY($1::text[]) FOR UPDATE", [ids])).rows;
+      const byId = new Map(locked.map(p => [p.id, p]));
+      items = [];
+      for (const id of ids) {
+        const p = byId.get(id);
+        const qty = Number(sess.cart[id]);
+        if (!p || !Number.isInteger(qty) || qty < 1 || Number(p.stock) < qty) {
+          await client.query("ROLLBACK");
+          sessions.delete(chatId);
+          return send(chatId, "موجودی یکی از غذاها تغییر کرده است. لطفاً سبد خرید را دوباره بررسی کنید.", MAIN);
+        }
+        items.push({ product_id: p.id, name: p.name, quantity: qty, unit_price: Number(p.price) });
+      }
+      for (const item of items) await client.query("UPDATE products SET stock=stock-$1,updated_at=NOW() WHERE id=$2", [item.quantity, item.product_id]);
+      await client.query(
+        `INSERT INTO customers(chat_id,name,phone,address,updated_at) VALUES($1,$2,$3,$4,NOW())
+         ON CONFLICT(chat_id) DO UPDATE SET name=EXCLUDED.name,phone=EXCLUDED.phone,address=EXCLUDED.address,updated_at=NOW()`,
+        [chatId, name || null, sess.phone, text]
+      );
+      const subtotal = items.reduce((sum, i) => sum + i.unit_price * i.quantity, 0);
+      order = await client.query(
+        "INSERT INTO orders(chat_id,customer_name,phone,address,items,subtotal,status) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+        [chatId, name || null, sess.phone, text, JSON.stringify(items), subtotal, "در انتظار تعیین هزینه ارسال"]
+      );
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally { client.release(); }
+    sessions.delete(chatId);
+    const orderId = order.rows[0].id;
+    const summary = items.map(i => `• ${i.name} × ${faNum(i.quantity)} = ${money(i.unit_price * i.quantity)}`).join("\n");
+    const subtotal = items.reduce((sum, i) => sum + i.unit_price * i.quantity, 0);
+    await send(chatId, `✅ سفارش شما ثبت شد.\nشماره سفارش: #${orderId}\n\n${summary}\n\nجمع غذاها: ${money(subtotal)}\nهزینه ارسال پس از بررسی مدیریت اعلام می‌شود و فاکتور نهایی برایتان ارسال خواهد شد.`, MAIN);
+    await sendAdminOrder(orderId, "🛒 سفارش جدید؛ تعیین هزینه ارسال لازم است");
+    return;
+  }
+
+  if (sess?.mode === "choose_preorder_product") {
+    const selected = text.split(" | ")[0].trim();
+    const p = (await pool.query("SELECT * FROM products WHERE name=$1", [selected])).rows[0];
+    if (!p) return send(chatId, "لطفاً غذا را از دکمه‌های فهرست انتخاب کنید.");
     sessions.set(chatId, { mode: "preorder_quantity", productId: p.id });
     return send(chatId, `چند عدد «${p.name}» برای فردا می‌خواهید؟ عدد را وارد کنید.`);
   }
   if (sess?.mode === "preorder_quantity") {
-    const qty = Number(text);
+    const qty = Number(text.replace(/[٬,،\s]/g, ""));
     if (!Number.isInteger(qty) || qty < 1 || qty > 100) return send(chatId, "تعداد معتبر از ۱ تا ۱۰۰ وارد کنید.");
     const p = (await pool.query("SELECT * FROM products WHERE id=$1", [sess.productId])).rows[0];
     sessions.delete(chatId);
     return createPreorder(chatId, name, p, qty);
   }
-  if (sess?.mode === "quantity") {
-    const qty = Number(text);
-    if (!Number.isInteger(qty) || qty < 1 || qty > 100) return send(chatId, "لطفاً تعداد معتبر از ۱ تا ۱۰۰ وارد کنید.");
-    const p = (await pool.query("SELECT * FROM products WHERE id=$1", [sess.productId])).rows[0];
-    if (!p || qty > p.stock) {
-      sessions.set(chatId, { mode: "quantity_shortage", productId: sess.productId, requested: qty });
-      return send(chatId, `از این غذا فقط ${p?.stock || 0} عدد موجود است.\nمی‌توانید موجودی فعلی را سفارش دهید یا برای تعداد درخواستی، پیش‌سفارش فردا ثبت کنید.`, keyboard([["🛒 سفارش موجودی فعلی"], ["🕒 درخواست برای فردا"], ["🍽️ مشاهده منو"]]));
-    }
-    sessions.set(chatId, { mode: "confirm", productId: p.id, qty });
-    return send(chatId, `خلاصه سفارش:\n${p.name} × ${faNum(qty)}\nجمع غذاها: ${money(p.price * qty)}\n\nبرای ادامه «تأیید سفارش» را بزنید یا «لغو» بنویسید.`);
-  }
-  if (sess?.mode === "quantity_shortage" && text === "🕒 درخواست برای فردا") {
-    const p = (await pool.query("SELECT * FROM products WHERE id=$1", [sess.productId])).rows[0];
-    sessions.set(chatId, { mode: "preorder_quantity", productId: p.id });
-    return send(chatId, `چند عدد «${p.name}» برای فردا می‌خواهید؟`);
-  }
-  if (sess?.mode === "quantity_shortage" && text === "🛒 سفارش موجودی فعلی") {
-    const p = (await pool.query("SELECT * FROM products WHERE id=$1", [sess.productId])).rows[0];
-    if (!p || p.stock <= 0) return send(chatId, "موجودی این غذا تمام شده است؛ برای فردا درخواست ثبت کنید.", keyboard([["🕒 درخواست برای فردا"]]));
-    sessions.set(chatId, { mode: "confirm", productId: p.id, qty: Math.min(sess.requested, p.stock) });
-    return send(chatId, `از «${p.name}» تعداد ${faNum(Math.min(sess.requested, p.stock))} عدد موجود است.\nبرای ثبت سفارش همین تعداد، «تأیید سفارش» را بزنید.`);
-  }
-  if (sess?.mode === "confirm" && text === "لغو") {
-    sessions.delete(chatId);
-    return send(chatId, "سفارش لغو شد.", MAIN);
-  }
-  if (sess?.mode === "confirm" && text === "تأیید سفارش") {
-    const p = (await pool.query("SELECT * FROM products WHERE id=$1", [sess.productId])).rows[0];
-    if (!p || p.stock < sess.qty) {
-      sessions.delete(chatId);
-      return send(chatId, "متأسفانه موجودی تغییر کرده است. لطفاً منو را دوباره بررسی کنید.", MAIN);
-    }
-    sessions.set(chatId, { mode: "contact_phone", productId: p.id, qty: sess.qty });
-    return send(chatId, "برای ثبت سفارش، شماره تماس خود را ارسال کنید (فقط شماره را بنویسید).");
-  }
-  if (sess?.mode === "contact_phone") {
-    const phone = text.replace(/\s/g, "");
-    if (!/^[+0-9۰-۹-]{8,18}$/.test(phone)) return send(chatId, "شماره تماس معتبر وارد کنید.");
-    sessions.set(chatId, { ...sess, mode: "contact_address", phone });
-    return send(chatId, "حالا نشانی کامل تحویل غذا را بنویسید.");
-  }
-  if (sess?.mode === "contact_address") {
-    if (text.length < 8) return send(chatId, "لطفاً نشانی کامل‌تری وارد کنید.");
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      const p = (await client.query("SELECT * FROM products WHERE id=$1 FOR UPDATE", [sess.productId])).rows[0];
-      if (!p || p.stock < sess.qty) {
-        await client.query("ROLLBACK");
-        sessions.delete(chatId);
-        return send(chatId, "موجودی در این فاصله تغییر کرده است. لطفاً دوباره منو را بررسی کنید.", MAIN);
-      }
-      // Reserve inventory when customer confirms the order and provides contact details.
-      await client.query("UPDATE products SET stock=stock-$1,updated_at=NOW() WHERE id=$2", [sess.qty, p.id]);
-      await client.query(
-        "INSERT INTO customers(chat_id,name,phone,address,updated_at) VALUES($1,$2,$3,$4,NOW()) ON CONFLICT(chat_id) DO UPDATE SET name=EXCLUDED.name,phone=EXCLUDED.phone,address=EXCLUDED.address,updated_at=NOW()",
-        [chatId, name || null, sess.phone, text]
-      );
-      const subtotal = p.price * sess.qty;
-      const order = await client.query(
-        "INSERT INTO orders(chat_id,customer_name,phone,address,items,subtotal,status) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id",
-        [chatId, name || null, sess.phone, text, JSON.stringify([{ product_id:p.id, name:p.name, quantity:sess.qty, unit_price:p.price }]), subtotal, "در انتظار تعیین هزینه ارسال"]
-      );
-      await client.query("COMMIT");
-      sessions.delete(chatId);
-      await send(chatId, `✅ درخواست سفارش شما ثبت شد.\nشماره سفارش: #${order.rows[0].id}\nغذا: ${p.name} × ${faNum(sess.qty)}\nجمع غذاها: ${money(subtotal)}\n\nهزینه پیک/اسنپ را مدیریت تعیین می‌کند. پس از آن فاکتور نهایی برای شما ارسال می‌شود.`, MAIN);
-      await sendAdminOrder(order.rows[0].id, "🛒 سفارش جدید؛ تعیین هزینه ارسال لازم است");
-      return;
-    } catch (e) {
-      await client.query("ROLLBACK").catch(()=>{});
-      throw e;
-    } finally { client.release(); }
-  }
 
-  // A product name can be selected directly from the always-visible menu.
-  const product = (await pool.query("SELECT * FROM products WHERE name=$1", [text])).rows[0];
-  if (product) {
-    if (product.stock <= 0) {
-      sessions.set(chatId, { mode: "preorder_product", productId: product.id });
-      return send(chatId, `❌ «${product.name}» فعلاً موجود نیست.\nموجودی: ۰ عدد\nبرای درخواست فردا، دکمه زیر را بزنید.`, keyboard([["🕒 درخواست برای فردا"], ["🍽️ مشاهده منو"]]));
-    }
-    sessions.set(chatId, { mode: "quantity", productId: product.id });
-    return send(chatId, `${product.name}\nقیمت: ${money(product.price)}\nموجودی: ${faNum(product.stock)} عدد\nچند عدد می‌خواهید؟`);
-  }
-  if (text === "🕒 درخواست برای فردا") {
+  // Allow product selection from the menu even if the customer returns to it.
+  const direct = (await pool.query("SELECT * FROM products WHERE name=$1", [text])).rows[0];
+  if (direct) {
+    const cart = sess?.cart || {};
+    sessions.set(chatId, { mode: "cart", cart });
     const ps = await getProducts();
-    sessions.set(chatId, { mode: "choose_preorder_product" });
-    return send(chatId, "غذای مورد نظر برای فردا را انتخاب کنید:", keyboard(ps.map(p => [p.name]).concat([["🏠 منوی اصلی"]])));
+    return send(chatId, "برای افزودن غذا به سبد، از دکمه‌های منو استفاده کنید.", cartKeyboard(ps, cart));
   }
-  if (sess?.mode === "choose_preorder_product") {
-    const p = (await pool.query("SELECT * FROM products WHERE name=$1", [text])).rows[0];
-    if (!p) return send(chatId, "لطفاً یک غذا را از فهرست انتخاب کنید.");
-    sessions.set(chatId, { mode: "preorder_quantity", productId: p.id });
-    return send(chatId, `چند عدد «${p.name}» برای فردا می‌خواهید؟`);
-  }
-  return send(chatId, "برای دیدن غذاها «🍽️ مشاهده منو» را انتخاب کنید.", MAIN);
+  return send(chatId, "برای شروع، یکی از گزینه‌های منوی اصلی را انتخاب کنید.", MAIN);
 }
 
 async function pollLoop() {
@@ -629,4 +701,3 @@ app.get("/health", async (_req, res) => {
   console.error("Startup failed:", e);
   process.exit(1);
 });
-

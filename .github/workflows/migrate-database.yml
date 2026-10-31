@@ -1,0 +1,54 @@
+
+name: Migrate Render database to Supabase
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install PostgreSQL 18 tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates gnupg
+          sudo install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-18
+
+      - name: Export Render database
+        env:
+          RENDER_DATABASE_URL: ${{ secrets.RENDER_DATABASE_URL }}
+        run: |
+          test -n "$RENDER_DATABASE_URL"
+          pg_dump "$RENDER_DATABASE_URL" \
+            --format=custom \
+            --no-owner \
+            --no-acl \
+            --file=render-backup.dump
+
+      - name: Import into Supabase
+        env:
+          SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+        run: |
+          test -n "$SUPABASE_DATABASE_URL"
+          pg_restore \
+            --no-owner \
+            --no-acl \
+            --exit-on-error \
+            --dbname="$SUPABASE_DATABASE_URL" \
+            render-backup.dump
+
+      - name: Save backup file
+        uses: actions/upload-artifact@v4
+        with:
+          name: maman-hosna-render-backup
+          path: render-backup.dump
+          retention-days: 7

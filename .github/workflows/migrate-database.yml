@@ -23,6 +23,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client-18
 
+      
       - name: Export Render database
         env:
           RENDER_DATABASE_URL: ${{ secrets.RENDER_DATABASE_URL }}
@@ -34,10 +35,17 @@ jobs:
             --no-acl \
             --file=render-backup.dump
 
-            - name: Prepare restore list
+      - name: Save backup file
+        uses: actions/upload-artifact@v4
+        with:
+          name: maman-hosna-render-backup
+          path: render-backup.dump
+          retention-days: 7
+
+      - name: Prepare restore list
         run: |
           pg_restore --list render-backup.dump \
-           | grep -vE ' SCHEMA - public( |$)' \
+            | grep -vE ' SCHEMA - public( |$)' \
             > restore-list.txt
 
       - name: Import into Supabase
@@ -52,10 +60,3 @@ jobs:
             --exit-on-error \
             --dbname="$SUPABASE_DATABASE_URL" \
             render-backup.dump
-
-      - name: Save backup file
-        uses: actions/upload-artifact@v4
-        with:
-          name: maman-hosna-render-backup
-          path: render-backup.dump
-          retention-days: 7
